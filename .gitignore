@@ -1,0 +1,15 @@
+# Build artifacts
+build/
+__pycache__/
+*.pyc
+*.pyo
+
+# Log files
+*.log
+build_log.txt
+build_err.txt
+build_out.txt
+pyinstaller_build.log
+
+# Debug/temp files
+test_snmp_debug.py

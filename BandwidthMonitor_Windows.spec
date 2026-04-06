@@ -3,10 +3,15 @@
 
 import os
 import sys
+from PyInstaller.utils.hooks import collect_all, collect_data_files
+
+puresnmp_datas, puresnmp_binaries, puresnmp_hiddenimports = collect_all('puresnmp')
+x690_datas, x690_binaries, x690_hiddenimports = collect_all('x690')
+plugins_datas, plugins_binaries, plugins_hiddenimports = collect_all('puresnmp_plugins')
 
 # Collect net-snmp binaries if they exist in tools/ directory
 binaries = []
-tools_dir = os.path.join(os.path.dirname(__file__), 'tools')
+tools_dir = os.path.join(SPECPATH, 'tools')
 if os.path.exists(tools_dir):
     # If tools are bundled locally, include them
     for tool in ['snmpget.exe', 'snmpwalk.exe', 'snmpcmd.exe']:
@@ -30,13 +35,27 @@ else:
 a = Analysis(
     ['app.py'],
     pathex=[],
-    binaries=binaries,
-    datas=[],
-    hiddenimports=[],
+    binaries=binaries + puresnmp_binaries + x690_binaries + plugins_binaries,
+    datas=puresnmp_datas + x690_datas + plugins_datas,
+    hiddenimports=puresnmp_hiddenimports + x690_hiddenimports + plugins_hiddenimports + [
+        'matplotlib.backends.backend_tkagg',
+        'matplotlib.backends.backend_agg',
+        'tkinter',
+        'tkinter.ttk',
+        'tkinter.messagebox',
+        'asyncio',
+        'asyncio.selector_events',
+        'puresnmp_plugins',
+        'puresnmp_plugins.mpm',
+        'puresnmp_plugins.mpm.v1',
+        'puresnmp_plugins.mpm.v2c',
+        'puresnmp_plugins.mpm.v2x',
+        'puresnmp_plugins.mpm.v3',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tkinter'],
+    excludes=[],
     noarchive=False,
     optimize=0,
 )

@@ -2,12 +2,14 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
 import time
-import subprocess
+import asyncio
 import re
 import sys
 import os
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+import matplotlib.dates as mdates
+import numpy as np
 from collections import deque
 from datetime import datetime
 
@@ -26,10 +28,10 @@ class SNMPBandwidthMonitor:
         self.interfaces = {}  # {ip: {index: name}}
         self.unit = "Kbps"
         self.unit_options = ["Kbps", "Mbps", "Gbps"]
-        self.range_keys = ["15m", "30m", "1h", "3h", "6h"]
-        self.range_labels = {"15m": "15m", "30m": "30m", "1h": "1h", "3h": "3h", "6h": "6h"}
-        self.range_seconds = {"15m": 15 * 60, "30m": 30 * 60, "1h": 60 * 60, "3h": 3 * 60 * 60, "6h": 6 * 60 * 60}
-        self.selected_range = "15m"
+        self.range_keys = ["5m", "15m", "30m", "1h", "3h", "6h"]
+        self.range_labels = {"5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "3h": "3h", "6h": "6h"}
+        self.range_seconds = {"5m": 5 * 60, "15m": 15 * 60, "30m": 30 * 60, "1h": 60 * 60, "3h": 3 * 60 * 60, "6h": 6 * 60 * 60}
+        self.selected_range = "5m"
         self.poll_interval = 3  # seconds; longer interval avoids noisy 1s polling and counter jitter
         self.max_range_seconds = self.range_seconds["6h"]
         self.max_points = int(self.max_range_seconds / self.poll_interval) + 1
@@ -39,12 +41,7 @@ class SNMPBandwidthMonitor:
         self.setup_ui()
         self.bring_window_front()
         
-        # Check for SNMP tools
-        if not self.check_snmp_tools():
-            self.show_snmp_installation_guide()
-            self.info_label.config(text="⚠️  SNMP tools not found - see error message")
-        else:
-            self.info_label.config(text="Ready - Add devices manually")
+        self.info_label.config(text="Ready - Add devices manually")
         
     def bring_window_front(self):
         try:
@@ -142,10 +139,10 @@ class SNMPBandwidthMonitor:
 
     def on_unit_changed(self, event):
         self.unit = self.unit_var.get()
-        unit_name = self.unit
-        self.info_label.config(text=f"Display unit set to: {unit_name}")
+        self.info_label.config(text=f"Display unit set to: {self.unit}")
         if self.current_device:
-            self.refresh_current()
+            data = self.get_display_data(self.current_device)
+            self.update_graph(self.current_device, data)
 
     def on_range_changed(self, event):
         selected = self.range_var.get()
@@ -154,7 +151,8 @@ class SNMPBandwidthMonitor:
                 self.selected_range = key
                 break
         if self.current_device:
-            self.refresh_current()
+            data = self.get_display_data(self.current_device)
+            self.update_graph(self.current_device, data)
 
     def format_rate(self, rate_kbps):
         if self.unit == "Mbps":
@@ -174,9 +172,9 @@ class SNMPBandwidthMonitor:
         if not data:
             return []
         cutoff = time.time() - self.get_current_range_seconds()
-        filtered = [(label, in_rate, out_rate) for ts, label, in_rate, out_rate in data if ts >= cutoff]
+        filtered = [(ts, label, in_rate, out_rate) for ts, label, in_rate, out_rate in data if ts >= cutoff]
         if not filtered:
-            filtered = [(data[-1][1], data[-1][2], data[-1][3])]
+            filtered = [(data[-1][0], data[-1][1], data[-1][2], data[-1][3])]
         max_plot_points = 180
         if len(filtered) <= max_plot_points:
             return filtered
@@ -189,8 +187,8 @@ class SNMPBandwidthMonitor:
     def get_range_stats(self, data):
         if not data:
             return None
-        in_rates = [self.format_rate(item[1]) for item in data]
-        out_rates = [self.format_rate(item[2]) for item in data]
+        in_rates = [self.format_rate(item[2]) for item in data]
+        out_rates = [self.format_rate(item[3]) for item in data]
         return {
             'in': {
                 'min': min(in_rates),
@@ -216,146 +214,71 @@ class SNMPBandwidthMonitor:
         else:
             self.info_label.config(text="Please enter a valid IP address")
 
-    def get_snmp_tool_path(self, tool_name):
-        """Get path to SNMP tool, preferring bundled version"""
-        import platform
-        
-        # Try bundled tools first (in _internal/tools for PyInstaller single-file)
-        if hasattr(sys, '_MEIPASS'):
-            # Running as PyInstaller bundle
-            bundled_tools = os.path.join(sys._MEIPASS, 'tools')
-            tool_exe = f"{tool_name}.exe" if platform.system() == "Windows" else tool_name
-            tool_path = os.path.join(bundled_tools, tool_exe)
-            if os.path.exists(tool_path):
-                return tool_path
-        
-        # Fall back to system PATH
-        import shutil
-        tool_exe = f"{tool_name}.exe" if platform.system() == "Windows" else tool_name
-        system_path = shutil.which(tool_exe)
-        if system_path:
-            return system_path
-        
-        # Return tool name and let subprocess search PATH
-        return tool_exe
-    
-    def check_snmp_tools(self):
-        """Check if SNMP tools are available"""
-        import platform
+    def _snmp_run(self, coro):
+        """Run an async coroutine synchronously (safe in threads)"""
         try:
-            # Try to find snmpget - prefer bundled, then system
-            snmpget_path = self.get_snmp_tool_path('snmpget')
-            result = subprocess.run([snmpget_path, '-V'], capture_output=True, timeout=2)
-            return result.returncode == 0
-        except:
-            return False
-    
-    def show_snmp_installation_guide(self):
-        """Show installation guide for SNMP tools"""
-        import platform
-        os_name = platform.system()
-        
-        if os_name == "Darwin":  # macOS
-            guide = """SNMP Tools Required
-
-Please install net-snmp using Homebrew:
-  brew install net-snmp
-
-After installation, restart the app."""
-        elif os_name == "Linux":
-            guide = """SNMP Tools Required
-
-For Ubuntu/Debian:
-  sudo apt-get install snmp
-
-For RedHat/CentOS:
-  sudo yum install net-snmp-utils
-
-After installation, restart the app."""
-        else:  # Windows
-            guide = """SNMP Tools Required (Windows 10/11)
-
-1. Install via Chocolatey (recommended):
-   - Open Command Prompt as Administrator
-   - Run: choco install net-snmp
-   - Restart the app
-
-2. Or download manually:
-   - Visit: http://www.snmp.com/
-   - Download Net-SNMP for Windows
-   - Install and add to PATH
-
-3. Verify installation:
-   - Open Command Prompt
-   - Type: snmpget -V
-   - Should show version info
-
-After installation, restart the app."""
-        
-        messagebox.showerror("SNMP Tools Not Found", guide)
-        return False
+            # Windows ProactorEventLoop does not support UDP; use SelectorEventLoop
+            loop = asyncio.SelectorEventLoop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+        except Exception as e:
+            import traceback
+            print(f'[SNMP ERROR] {type(e).__name__}: {e}', file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            return None
     
     def get_interfaces(self, ip):
-        """Get list of interfaces on device"""
+        """Get list of interfaces on device using pure-Python SNMP"""
+        from puresnmp import PyWrapper, V2C, Client
+
         interfaces = {}
-        oids = [
-            ('1.3.6.1.2.1.31.1.1.1.1', r'ifName\.(\d+)\s*=\s*STRING:\s*(.*)'),
-            ('1.3.6.1.2.1.2.2.1.2', r'ifDescr\.(\d+)\s*=\s*STRING:\s*(.*)')
+        base_oids = [
+            '1.3.6.1.2.1.31.1.1.1.1',  # ifName
+            '1.3.6.1.2.1.2.2.1.2',      # ifDescr
         ]
 
-        snmpwalk_path = self.get_snmp_tool_path('snmpwalk')
-        
-        for oid, pattern in oids:
+        async def _walk(base_oid):
+            client = PyWrapper(Client(ip, V2C(self.community)))
+            results = []
+            async for vb in client.walk(base_oid):
+                results.append(vb)
+            return results
+
+        for base_oid in base_oids:
             try:
-                result = subprocess.run(
-                    [snmpwalk_path, '-v2c', '-c', self.community, ip, oid],
-                    capture_output=True,
-                    timeout=3,
-                    text=True
-                )
-                if result.returncode == 0:
-                    lines = result.stdout.strip().split('\n')
-                    for line in lines:
-                        match = re.search(pattern, line)
-                        if match:
-                            index = int(match.group(1))
-                            name = match.group(2).strip()
-                            if name:
-                                interfaces[index] = name
-                elif result.returncode != 0:
-                    print(f"SNMP error getting interfaces for {ip} OID {oid}: {result.stderr.strip()}", file=sys.stderr)
-            except FileNotFoundError:
-                # snmpwalk not found
-                print(f"snmpwalk tool not found. Please install net-snmp tools.", file=sys.stderr)
-                return {1: "Interface 1"}
-            except subprocess.TimeoutExpired:
-                print(f"Timeout getting interfaces for {ip} (OID {oid})", file=sys.stderr)
+                results = self._snmp_run(_walk(base_oid))
+                if not results:
+                    continue
+                for vb in results:
+                    oid_str = str(vb.oid)
+                    index = int(oid_str.split('.')[-1])
+                    value = vb.value
+                    name = value.decode('utf-8', errors='replace').strip() if isinstance(value, bytes) else str(value).strip()
+                    if name:
+                        interfaces[index] = name
+                if interfaces:
+                    break
             except Exception as e:
-                print(f"Error getting interfaces for {ip} (OID {oid}): {type(e).__name__}: {e}", file=sys.stderr)
+                print(f"Error getting interfaces for {ip} OID {base_oid}: {e}", file=sys.stderr)
 
         return interfaces
     
     def get_snmp_value(self, ip, oid):
-        """Get a single SNMP value using snmpget"""
-        snmpget_path = self.get_snmp_tool_path('snmpget')
+        """Get a single SNMP value using pure-Python SNMP"""
+        from puresnmp import PyWrapper, V2C, Client
+
+        async def _get():
+            client = PyWrapper(Client(ip, V2C(self.community)))
+            return await client.get(oid)
+
         try:
-            result = subprocess.run(
-                [snmpget_path, '-v2c', '-c', self.community, '-Ovq', ip, oid],
-                capture_output=True,
-                timeout=3,
-                text=True
-            )
-            if result.returncode == 0 and result.stdout:
-                raw = result.stdout.strip()
-                match = re.search(r'-?\d+', raw)
-                if match:
-                    return int(match.group(0))
-            elif result.returncode != 0:
-                print(f"SNMP error for {ip} OID {oid}: {result.stderr.strip()}", file=sys.stderr)
-            return 0
-        except FileNotFoundError:
-            print(f"snmpget tool not found. Please install net-snmp tools.", file=sys.stderr)
-            return 0
+            result = self._snmp_run(_get())
+            if result is None:
+                return 0
+            return int(result)
         except Exception as e:
             print(f"SNMP exception for {ip} OID {oid}: {type(e).__name__}: {e}", file=sys.stderr)
             return 0
@@ -508,34 +431,77 @@ After installation, restart the app."""
             self.stats_out_label.config(text="Out: collecting data...")
         self.info_label.config(text=f"{self.current_device} | {interface_name} | In: {display_in:.1f} {unit} | Out: {display_out:.1f} {unit}")
     
+    def _smooth(self, values, window=9):
+        """Smooth data with Gaussian-weighted convolution"""
+        arr = np.array(values, dtype=float)
+        if len(arr) < 3:
+            return arr
+        w = min(window, len(arr))
+        if w % 2 == 0:
+            w -= 1
+        if w < 3:
+            return arr
+        x = np.arange(w) - w // 2
+        kernel = np.exp(-0.5 * (x / max(w / 4.0, 0.1)) ** 2)
+        kernel /= kernel.sum()
+        padded = np.pad(arr, (w // 2, w // 2), mode='edge')
+        return np.convolve(padded, kernel, mode='valid')[:len(arr)]
+
     def update_graph(self, ip, data=None):
         self.ax.clear()
-        self.ax.set_title(f"Bandwidth Monitor - {ip} (Interface {self.current_interface})")
-        self.ax.set_xlabel("Time")
-        self.ax.set_ylabel(f"Bandwidth ({self.unit_label()})")
-        self.ax.grid(True, alpha=0.3)
+        self.fig.patch.set_facecolor('#f8f9fa')
+        self.ax.set_facecolor('#ffffff')
+        self.ax.set_title(f"Bandwidth Monitor - {ip} (Interface {self.current_interface})", fontsize=11, pad=8)
+        self.ax.set_xlabel("Time", fontsize=9)
+        self.ax.set_ylabel(f"Bandwidth ({self.unit_label()})", fontsize=9)
+        self.ax.grid(True, alpha=0.2, linestyle='--', color='#aaaaaa')
+        for spine in self.ax.spines.values():
+            spine.set_visible(False)
 
         if data is None:
             data = self.get_display_data(ip)
 
-        if data:
-            labels = [x[0] for x in data]
-            in_data = [self.format_rate(x[1]) for x in data]
-            out_data = [self.format_rate(x[2]) for x in data]
-            x_values = list(range(len(labels)))
+        now = time.time()
+        range_secs = self.get_current_range_seconds()
+        t_start = datetime.fromtimestamp(now - range_secs)
+        t_end = datetime.fromtimestamp(now)
 
-            self.ax.plot(x_values, in_data, label="Traffic In", color="#1f77b4", marker='o')
-            self.ax.plot(x_values, out_data, label="Traffic Out", color="#2ca02c", marker='s')
-            tick_step = max(1, len(x_values) // 12)
-            self.ax.set_xticks(x_values[::tick_step])
-            self.ax.set_xticklabels([labels[i] for i in x_values[::tick_step]], rotation=45, ha='right')
-            self.ax.legend(loc='upper left')
-            self.ax.relim()
-            self.ax.autoscale_view()
+        if data and len(data) >= 2:
+            t_nums = np.array([x[0] for x in data])
+            in_vals  = np.array([self.format_rate(x[2]) for x in data])
+            out_vals = np.array([self.format_rate(x[3]) for x in data])
+
+            in_smooth  = np.clip(self._smooth(in_vals),  0, None)
+            out_smooth = np.clip(self._smooth(out_vals), 0, None)
+
+            n_dense = max(len(data) * 8, 400)
+            t_dense = np.linspace(t_nums[0], t_nums[-1], n_dense)
+            in_dense  = np.clip(np.interp(t_dense, t_nums, in_smooth),  0, None)
+            out_dense = np.clip(np.interp(t_dense, t_nums, out_smooth), 0, None)
+            t_dt = [datetime.fromtimestamp(t) for t in t_dense]
+
+            color_in  = "#1f77b4"
+            color_out = "#2ca02c"
+            self.ax.fill_between(t_dt, in_dense,  alpha=0.20, color=color_in)
+            self.ax.fill_between(t_dt, out_dense, alpha=0.20, color=color_out)
+            self.ax.plot(t_dt, in_dense,  color=color_in,  linewidth=2.0, label="Traffic In")
+            self.ax.plot(t_dt, out_dense, color=color_out, linewidth=2.0, label="Traffic Out")
+            self.ax.legend(loc='upper left', fontsize=8, framealpha=0.7, edgecolor='none')
+            self.ax.set_ylim(bottom=0)
+
+        elif data and len(data) == 1:
+            t = datetime.fromtimestamp(data[0][0])
+            self.ax.plot([t], [self.format_rate(data[0][2])], 'o', color="#1f77b4", label="Traffic In")
+            self.ax.plot([t], [self.format_rate(data[0][3])], 's', color="#2ca02c", label="Traffic Out")
+            self.ax.legend(loc='upper left', fontsize=8)
             self.ax.set_ylim(bottom=0)
         else:
-            self.ax.text(0.5, 0.5, 'Collecting data...', ha='center', va='center', transform=self.ax.transAxes)
+            self.ax.text(0.5, 0.5, 'Collecting data...', ha='center', va='center',
+                         transform=self.ax.transAxes, fontsize=12, color='gray')
 
+        self.ax.set_xlim(t_start, t_end)
+        self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        self.fig.autofmt_xdate(rotation=45)
         self.canvas.draw_idle()
 
 if __name__ == "__main__":
